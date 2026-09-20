@@ -1,119 +1,87 @@
-import { exec, execSync } from "child_process";
+import { spawn } from "child_process";
+import { createGzip } from "zlib";
 import { S3Client, S3ClientConfig, PutObjectCommandInput } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
-import { createReadStream, unlink, statSync } from "fs";
-import { filesize } from "filesize";
-import path from "path";
-import os from "os";
 
 import { env } from "./env.js";
-import { createMD5 } from "./util.js";
 
-const uploadToS3 = async ({ name, path }: { name: string, path: string }) => {
-  console.log("Uploading backup to S3...");
+// Streams pg_dump's output straight into the S3 upload (pg_dump | gzip -> Upload),
+// instead of buffering the whole dump on disk first. Writing a multi-hundred-MB
+// file to a container's tmpfs/page cache counts toward billed memory usage just
+// like an in-process buffer would, so this keeps memory bounded to the streaming
+// chunk size regardless of database size.
+const dumpAndUpload = async ({ name }: { name: string }) => {
+  if (env.SUPPORT_OBJECT_LOCK) {
+    throw new Error(
+      "SUPPORT_OBJECT_LOCK requires hashing the full archive up front and isn't supported by the streaming backup path."
+    );
+  }
 
   const bucket = env.AWS_S3_BUCKET;
+  const key = env.BUCKET_SUBFOLDER ? `${env.BUCKET_SUBFOLDER}/${name}` : name;
+
+  const backupOptions = env.BACKUP_OPTIONS.split(/\s+/u).filter(Boolean);
+  const child = spawn(
+    "pg_dump",
+    [`--dbname=${env.BACKUP_DATABASE_URL}`, "--format=tar", ...backupOptions],
+    { stdio: ["ignore", "pipe", "pipe"] }
+  );
+
+  let stderrOutput = "";
+  child.stderr.on("data", (chunk) => {
+    stderrOutput += chunk.toString();
+  });
+
+  const gzip = createGzip();
+  child.stdout.pipe(gzip);
+
+  // pg_dump exiting non-zero after already streaming partial output would
+  // otherwise look like a normal end-of-stream to the uploader - destroying
+  // the gzip stream turns that into an upload failure instead of a silently
+  // truncated backup.
+  child.on("error", (error) => gzip.destroy(error));
+  child.on("close", (code) => {
+    if (code !== 0) {
+      gzip.destroy(new Error(`pg_dump exited with code ${code}: ${stderrOutput.trimEnd()}`));
+    }
+  });
 
   const clientOptions: S3ClientConfig = {
     region: env.AWS_S3_REGION,
-    forcePathStyle: env.AWS_S3_FORCE_PATH_STYLE
-  }
+    forcePathStyle: env.AWS_S3_FORCE_PATH_STYLE,
+  };
 
   if (env.AWS_S3_ENDPOINT) {
     console.log(`Using custom endpoint: ${env.AWS_S3_ENDPOINT}`);
-
     clientOptions.endpoint = env.AWS_S3_ENDPOINT;
   }
 
-  if (env.BUCKET_SUBFOLDER) {
-    name = env.BUCKET_SUBFOLDER + "/" + name;
-  }
-
-  let params: PutObjectCommandInput = {
+  const params: PutObjectCommandInput = {
     Bucket: bucket,
-    Key: name,
-    Body: createReadStream(path),
-  }
-
-  if (env.SUPPORT_OBJECT_LOCK) {
-    console.log("MD5 hashing file...");
-
-    const md5Hash = await createMD5(path);
-
-    console.log("Done hashing file");
-
-    params.ContentMD5 = Buffer.from(md5Hash, 'hex').toString('base64');
-  }
+    Key: key,
+    Body: gzip,
+  };
 
   const client = new S3Client(clientOptions);
 
-  await new Upload({
-    client,
-    params: params
-  }).done();
+  console.log("Streaming DB dump to S3...");
+  await new Upload({ client, params }).done();
+
+  if (stderrOutput !== "") {
+    console.log({ stderr: stderrOutput.trimEnd() });
+  }
 
   console.log("Backup uploaded to S3...");
-}
-
-const dumpToFile = async (filePath: string) => {
-  console.log("Dumping DB to file...");
-
-  await new Promise((resolve, reject) => {
-    exec(`pg_dump --dbname=${env.BACKUP_DATABASE_URL} --format=tar ${env.BACKUP_OPTIONS} | gzip > ${filePath}`, (error, stdout, stderr) => {
-      if (error) {
-        reject({ error: error, stderr: stderr.trimEnd() });
-        return;
-      }
-
-      // check if archive is valid and contains data
-      const isValidArchive = (execSync(`gzip -cd ${filePath} | head -c1`).length == 1) ? true : false;
-      if (isValidArchive == false) {
-        reject({ error: "Backup archive file is invalid or empty; check for errors above" });
-        return;
-      }
-
-      // not all text in stderr will be a critical error, print the error / warning
-      if (stderr != "") {
-        console.log({ stderr: stderr.trimEnd() });
-      }
-
-      console.log("Backup archive file is valid");
-      console.log("Backup filesize:", filesize(statSync(filePath).size));
-
-      // if stderr contains text, let the user know that it was potently just a warning message
-      if (stderr != "") {
-        console.log(`Potential warnings detected; Please ensure the backup file "${path.basename(filePath)}" contains all needed data`);
-      }
-
-      resolve(undefined);
-    });
-  });
-
-  console.log("DB dumped to file...");
-}
-
-const deleteFile = async (path: string) => {
-  console.log("Deleting file...");
-  await new Promise((resolve, reject) => {
-    unlink(path, (err) => {
-      reject({ error: err });
-      return;
-    });
-    resolve(undefined);
-  });
-}
+};
 
 export const backup = async () => {
   console.log("Initiating DB backup...");
 
   const date = new Date().toISOString();
-  const timestamp = date.replace(/[:.]+/g, '-');
+  const timestamp = date.replace(/[:.]+/g, "-");
   const filename = `${env.BACKUP_FILE_PREFIX}-${timestamp}.tar.gz`;
-  const filepath = path.join(os.tmpdir(), filename);
 
-  await dumpToFile(filepath);
-  await uploadToS3({ name: filename, path: filepath });
-  await deleteFile(filepath);
+  await dumpAndUpload({ name: filename });
 
   console.log("DB backup complete...");
-}
+};
